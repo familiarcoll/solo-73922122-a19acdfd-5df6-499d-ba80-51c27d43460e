@@ -131,8 +131,13 @@ def get_job(job_id: str):
 
 @app.post("/api/jobs/{job_id}/cancel")
 def cancel_job(job_id: str):
+    # 已处于终态（含已完成）的任务不可取消，manager 抛 409 由统一异常处理返回
     info = manager.cancel_job(job_id)
-    return {"job": info, "cancel_requested": True}
+    return {
+        "job": info,
+        "cancel_requested": True,
+        "accepted": info["status"] not in ("done", "failed", "superseded"),
+    }
 
 
 @app.get("/api/jobs/{job_id}/download/cleaned")
