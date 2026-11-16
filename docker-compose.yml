@@ -1,0 +1,23 @@
+services:
+  corpus-cleaner:
+    build: .
+    image: corpus-cleaner:1.0.0
+    container_name: corpus-cleaner
+    ports:
+      - "8000:8000"
+    volumes:
+      - corpus-data:/data
+    # 硬约束：内存 128 MiB；禁用 swap，防止超限后悄悄换页
+    mem_limit: 128m
+    memswap_limit: 128m
+    mem_reservation: 128m
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=5)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  corpus-data:

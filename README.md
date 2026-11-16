@@ -1,0 +1,128 @@
+# 语料清洗服务（FastAPI + SQLite）
+
+送训前剔除混入**保留题集（holdout）**的训练文本：训练记录只要与**任一保留记录**
+共享一段**连续 8 个词**，整条记录从净化文件中剔除，并输出剔除清单（训练 id、
+命中的保留 id、8 词证据）。
+
+- 分词：Python `str.split()`，按全部 Unicode 空白（含 Tab、全角空格 U+3000 等）切分
+- **区分大小写**，不做大小写归一化、不去标点
+- 单文件 ≤ **256 MiB**、单行 ≤ **64 KiB**，id 在文件内唯一（均为强制校验）
+- 净化输出**保持原行序、逐字节保留原始行**（含原行尾 CRLF/LF）
+- 容器内存限制 **128 MiB**，可处理远大于内存的文件（全流程磁盘流式 + SQLite 索引）
+
+## 快速启动
+
+```bash
+docker compose up --build
+# 打开 http://localhost:8000
+```
+
+Compose 已设置 `mem_limit=128m` 且禁用 swap（`memswap_limit=128m`），
+数据全部落在命名卷 `corpus-data`（SQLite 控制库、保留集索引、任务产物）。
+
+本地非容器运行：
+
+```bash
+pip install -r requirements.txt
+DATA_DIR=./data uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
+```
+
+## 网页操作
+
+1. **上传保留题集**（或点“载入演示保留集”），服务构建连续 8 词 SQLite 索引；
+2. **上传训练集并发起清洗**，列表实时显示进度（字节占比）、记录数、剔除数；
+3. 完成后下载：
+   - `cleaned.jsonl`：净化后的训练集，原行序、原行字节；
+   - `removals.jsonl`：每行 `{"id", "hit_retention_id", "evidence_8_words"}`；
+4. 可随时**取消**（立即受理，无需等扫描结束）并立刻发起新任务。
+
+## HTTP API
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/retention` | multipart 上传保留集，构建索引并原子更换 |
+| GET | `/api/retention` | 当前保留集版本与统计 |
+| POST | `/api/jobs` | multipart 上传训练集并创建清洗任务 |
+| GET | `/api/jobs` / `/api/jobs/{id}` | 任务列表 / 进度详情 |
+| POST | `/api/jobs/{id}/cancel` | 取消受理（置标志位，逐行感知，立即返回） |
+| GET | `/api/jobs/{id}/download/cleaned` | 下载净化文件（仅完成且保留集未更换） |
+| GET | `/api/jobs/{id}/download/removals` | 下载剔除清单 |
+| POST | `/api/demo/retention`、`/api/demo/training` | 一键演示数据 |
+| GET | `/healthz` | 健康检查 |
+
+错误返回统一为 `{"error": "中文原因"}`，状态码：400 输入非法、404 不存在、
+409 状态冲突（无保留集/任务未完成）、410 保留集已更换导致结果禁止下载、
+413 隐含于 400 的 256 MiB 上限校验。
+
+## 关键设计
+
+### 大于内存的处理（128 MiB 容器）
+
+- 上传：1 MiB 分块流式落临时文件，不进入内存，超限立即拒绝；
+- 保留集索引：一次性扫描构建 SQLite 库，批量 `INSERT OR IGNORE`，
+  `cache_size=-2000`（页缓存上限 2 MiB），进程内不持有整张索引；
+- 清洗：逐行读取（单行 ≤ 64 KiB），每行最多保留一行数据；
+  8 词窗口逐条在 SQLite 走主键查询；命中即停，不再查后续窗口；
+- 训练集 id 唯一性：写入任务私有的 SQLite `seen_ids` 表，不占用内存；
+- 索引查询：每条记录的全部窗口用 `IN` 批量查询（按 900 个哈希分块，
+  兼容各 SQLite 版本 999 变量上限），再以精确键按窗口顺序裁决首个命中，
+  避免逐窗口往返 SQLite；
+- 输出：净化文件与剔除清单先写 `.tmp`，成功后 `os.replace` 原子发布。
+
+201 MiB 训练集 + 65 MiB 保留集（约 307 万窗口）实测：扫描约 4.5 分钟，
+进程峰值 RSS 约 **61 MiB**，且全程平稳不随数据量增长。
+
+### 哈希碰撞不误判
+
+`ngrams` 表主键为 `(blake2b-128 哈希, 精确窗口键, 保留id)`，查询要求
+哈希与无歧义精确键（每词带长度前缀 + 单元分隔符编码）同时相等，
+因此哈希碰撞不会造成错误剔除。
+
+### 保留集更换语义
+
+- 更换在单个 SQLite 事务内切换“当前版本”指针；构建失败则删除半成品、
+  **原保留集与既有结果完全不变**；
+- 耗时的索引构建在主锁之外进行（独立的更换串行锁），构建期间正在运行的
+  扫描与网页进度查询不受阻塞；只有最后版本切换短暂持锁；
+- 更换成功后：
+  - 排队中的旧任务立即标记 `superseded`；
+  - 运行中的旧任务在扫描结束发布前再次校验版本，拒绝发布；
+  - 已完成旧任务的任何新下载返回 **410**；
+  - 无任务引用的旧版本文件立即清理。
+
+### 取消与任务隔离
+
+- 单 worker 线程 + 任务队列（最多 1 运行 + 1 排队）；取消只置标志位，
+  扫描循环逐行检查，接口立即返回，取消后可立刻创建新任务；
+- 每个任务独占 `jobs/{job_id}/` 目录（上传件、临时输出、去重库），
+  旧任务的清理只操作自己的目录，不可能影响新任务。
+
+### 失败 / 重启不开放半成品
+
+- 所有非成功结束（失败、取消、被更换）都删除 `.tmp` 与去重库；
+- 启动时控制库中处于 `queued/running` 的任务一律改写为 `failed`
+  并清理临时文件；下载仅对 `done` 且保留集版本仍为当前版本的任务开放。
+
+## 目录结构
+
+```
+app/
+  config.py       约束常量与 SQLite 内存参数
+  errors.py       业务校验异常
+  tokenizer.py    Unicode 空白分词、8 词窗口与无歧义编码
+  jsonl_utils.py  二进制流式 JSONL 读取与大小/结构校验
+  index_store.py  保留集 8 词 SQLite 索引构建/只读查询
+  manager.py      状态机、后台 worker、取消、更换门禁、重启恢复
+  main.py         FastAPI 路由与流式上传
+  static/index.html  演示网页（无构建步骤）
+tests/            18 个功能/API/并发测试 + 大文件压力测试
+Dockerfile / docker-compose.yml
+```
+
+## 自测
+
+```bash
+pip install pytest httpx
+python -m pytest tests/ -q            # 功能与 API 全链路
+RUN_LARGE=1 python -m pytest tests/test_large.py -s   # 300 MiB 级流式压测
+```

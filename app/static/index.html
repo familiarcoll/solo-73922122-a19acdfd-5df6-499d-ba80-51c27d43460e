@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>语料清洗台 · 保留题集去污染</title>
+<style>
+  :root {
+    --bg: #0f1420;
+    --panel: #182033;
+    --panel-2: #1f2a42;
+    --line: #2b3856;
+    --text: #e8edf7;
+    --muted: #93a0bb;
+    --accent: #5b8cff;
+    --accent-2: #38d39f;
+    --warn: #ffb454;
+    --danger: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font: 14px/1.6 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  header {
+    padding: 20px 28px;
+    border-bottom: 1px solid var(--line);
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+  }
+  header h1 { margin: 0; font-size: 20px; }
+  header span { color: var(--muted); font-size: 13px; }
+  main {
+    max-width: 1080px;
+    margin: 24px auto;
+    padding: 0 20px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 18px;
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 18px;
+  }
+  .panel.wide { grid-column: 1 / -1; }
+  .panel h2 {
+    margin: 0 0 12px;
+    font-size: 15px;
+    color: var(--accent);
+  }
+  .hint { color: var(--muted); font-size: 12px; margin: 6px 0 12px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  button {
+    background: var(--accent);
+    color: #fff;
+    border: 0;
+    border-radius: 8px;
+    padding: 9px 16px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  button.secondary { background: var(--panel-2); border: 1px solid var(--line); }
+  button.danger { background: var(--danger); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  input[type=file] {
+    color: var(--muted);
+    max-width: 260px;
+  }
+  .kv { display: grid; grid-template-columns: 110px 1fr; gap: 4px 10px; font-size: 13px; }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; word-break: break-all; }
+  .badge {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    border: 1px solid var(--line);
+  }
+  .badge.queued { color: var(--warn); border-color: var(--warn); }
+  .badge.running { color: var(--accent); border-color: var(--accent); }
+  .badge.done { color: var(--accent-2); border-color: var(--accent-2); }
+  .badge.failed, .badge.canceled, .badge.superseded { color: var(--danger); border-color: var(--danger); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td {
+    text-align: left;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--line);
+    vertical-align: top;
+  }
+  th { color: var(--muted); font-weight: 500; }
+  .bar {
+    height: 8px;
+    background: var(--panel-2);
+    border-radius: 999px;
+    overflow: hidden;
+    min-width: 120px;
+  }
+  .bar i {
+    display: block;
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent), var(--accent-2));
+    width: 0;
+  }
+  a.dl { color: var(--accent-2); text-decoration: none; margin-right: 10px; font-size: 12px; }
+  a.dl.disabled { color: var(--muted); pointer-events: none; }
+  #toast {
+    position: fixed;
+    right: 24px;
+    bottom: 24px;
+    max-width: 420px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .toast-item {
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-left: 4px solid var(--accent);
+    border-radius: 8px;
+    padding: 10px 14px;
+    font-size: 13px;
+  }
+  .toast-item.err { border-left-color: var(--danger); }
+  .empty { color: var(--muted); font-size: 13px; padding: 10px 0; }
+  code { color: var(--warn); }
+</style>
+</head>
+<body>
+<header>
+  <h1>语料清洗台</h1>
+  <span>按 Unicode 空白分词 · 区分大小写 · 连续 8 词命中即整条剔除 · 保留原行字节与行序</span>
+</header>
+
+<main>
+  <section class="panel">
+    <h2>① 保留题集（holdout）</h2>
+    <p class="hint">JSONL，每行 <code>{"id": "...", "text": "..."}</code>，单文件 ≤ 256 MiB、单行 ≤ 64 KiB。更换成功后旧任务结果立即停止下载。</p>
+    <div class="row">
+      <input type="file" id="retentionFile" accept=".jsonl,application/x-ndjson" />
+      <button id="uploadRetention">上传并构建索引</button>
+      <button class="secondary" id="demoRetention">载入演示保留集</button>
+    </div>
+    <dl class="kv" id="retentionInfo" style="margin-top:14px">
+      <dt>当前状态</dt><dd><span class="empty">尚未上传</span></dd>
+    </dl>
+  </section>
+
+  <section class="panel">
+    <h2>② 训练集并发起清洗</h2>
+    <p class="hint">每次清洗固定本次上传的训练输入；取消受理后可立刻发起新任务，互不影响。</p>
+    <div class="row">
+      <input type="file" id="trainingFile" accept=".jsonl,application/x-ndjson" />
+      <button id="startJob">上传并开始清洗</button>
+      <button class="secondary" id="demoTraining">载入演示训练集</button>
+    </div>
+    <p class="hint">限制：单文件 ≤ 256 MiB、单行 ≤ 64 KiB；id 在文件内唯一。</p>
+  </section>
+
+  <section class="panel wide">
+    <h2>③ 任务进度与结果</h2>
+    <div class="row" style="margin-bottom:10px">
+      <button class="secondary" id="refreshJobs">刷新</button>
+      <label class="hint"><input type="checkbox" id="autoRefresh" checked /> 每 1.5 秒自动刷新</label>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>任务 / 文件</th><th>状态</th><th>进度</th>
+          <th>记录 / 剔除</th><th>保留集版本</th><th>操作</th>
+        </tr>
+      </thead>
+      <tbody id="jobRows">
+        <tr><td colspan="6" class="empty">暂无任务</td></tr>
+      </tbody>
+    </table>
+  </section>
+</main>
+
+<div id="toast"></div>
+
+<script>
+const STATUS_LABEL = {
+  queued: "排队中", running: "扫描中", done: "已完成",
+  failed: "失败", canceled: "已取消", superseded: "保留集已更换"
+};
+
+function toast(msg, isErr = false) {
+  const el = document.createElement("div");
+  el.className = "toast-item" + (isErr ? " err" : "");
+  el.textContent = msg;
+  document.getElementById("toast").appendChild(el);
+  setTimeout(() => el.remove(), 6000);
+}
+
+async function upload(url, file) {
+  const fd = new FormData();
+  fd.append("file", file);
+  const resp = await fetch(url, { method: "POST", body: fd });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    throw new Error(data.error || data.detail || ("HTTP " + resp.status));
+  }
+  return data;
+}
+
+async function postJson(url) {
+  const resp = await fetch(url, { method: "POST" });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data.error || data.detail || ("HTTP " + resp.status));
+  return data;
+}
+
+function fmtBytes(n) {
+  if (n == null) return "-";
+  const units = ["B", "KiB", "MiB", "GiB"];
+  let v = n, i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return v.toFixed(i ? 1 : 0) + " " + units[i];
+}
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+async function loadRetention() {
+  const resp = await fetch("/api/retention");
+  const data = await resp.json();
+  const box = document.getElementById("retentionInfo");
+  const r = data.retention;
+  if (!r) {
+    box.innerHTML = '<dt>当前状态</dt><dd><span class="empty">尚未上传</span></dd>';
+    return;
+  }
+  box.innerHTML = `
+    <dt>版本</dt><dd>v${r.version}</dd>
+    <dt>文件</dt><dd>${esc(r.file_name)}（${fmtBytes(r.byte_size)}）</dd>
+    <dt>保留记录</dt><dd>${r.record_count} 条</dd>
+    <dt>8 词窗口</dt><dd>${r.window_count} 个（去重后）</dd>
+    <dt>建立时间</dt><dd>${new Date(r.created_at * 1000).toLocaleString()}</dd>`;
+}
+
+async function loadJobs() {
+  const resp = await fetch("/api/jobs");
+  const data = await resp.json();
+  const tbody = document.getElementById("jobRows");
+  const jobs = data.jobs || [];
+  if (!jobs.length) {
+    tbody.innerHTML = '<tr><td colspan="6" class="empty">暂无任务</td></tr>';
+    return;
+  }
+  jobs.sort((a, b) => b.created_at - a.created_at);
+  tbody.innerHTML = jobs.map(j => {
+    const pct = Math.round((j.progress || 0) * 100);
+    const active = j.status === "queued" || j.status === "running";
+    const downloadable = j.status === "done";
+    const errCell = j.error ? `<div class="hint" style="color:var(--danger)">${esc(j.error)}</div>` : "";
+    return `<tr>
+      <td><code>${esc(j.job_id.slice(0, 8))}</code><br/>
+        <span class="hint">${esc(j.file_name)} · ${fmtBytes(j.byte_size)}</span>${errCell}</td>
+      <td><span class="badge ${j.status}">${STATUS_LABEL[j.status] || j.status}</span></td>
+      <td><div class="bar"><i style="width:${pct}%"></i></div>
+        <span class="hint">${pct}%</span></td>
+      <td>${j.total_lines ?? "-"} / <b style="color:var(--danger)">${j.removed_lines ?? "-"}</b></td>
+      <td>v${j.retention_version}</td>
+      <td>
+        ${active
+          ? `<button class="danger" onclick="cancelJob('${j.job_id}')">取消</button>`
+          : `<a class="dl ${downloadable ? "" : "disabled"}"
+              href="/api/jobs/${j.job_id}/download/cleaned">净化文件</a>
+             <a class="dl ${downloadable ? "" : "disabled"}"
+              href="/api/jobs/${j.job_id}/download/removals">剔除清单</a>`}
+      </td>
+    </tr>`;
+  }).join("");
+}
+
+window.cancelJob = async function (jobId) {
+  try {
+    await postJson(`/api/jobs/${jobId}/cancel`);
+    toast("取消已受理，扫描将在当前行处理后停止；可立即发起新任务");
+    loadJobs();
+  } catch (e) { toast(e.message, true); }
+};
+
+document.getElementById("uploadRetention").onclick = async () => {
+  const f = document.getElementById("retentionFile").files[0];
+  if (!f) return toast("请先选择保留集文件", true);
+  try {
+    await upload("/api/retention", f);
+    toast("保留集更换成功，旧任务结果已停止发布");
+    loadRetention(); loadJobs();
+  } catch (e) { toast("保留集更换失败，原保留集与结果保持不变：" + e.message, true); }
+};
+
+document.getElementById("startJob").onclick = async () => {
+  const f = document.getElementById("trainingFile").files[0];
+  if (!f) return toast("请先选择训练集文件", true);
+  try {
+    await upload("/api/jobs", f);
+    toast("清洗任务已创建");
+    loadJobs();
+  } catch (e) { toast(e.message, true); }
+};
+
+document.getElementById("demoRetention").onclick = async () => {
+  try { await postJson("/api/demo/retention"); toast("演示保留集已载入"); loadRetention(); }
+  catch (e) { toast(e.message, true); }
+};
+document.getElementById("demoTraining").onclick = async () => {
+  try { await postJson("/api/demo/training"); toast("演示训练集任务已创建"); loadJobs(); }
+  catch (e) { toast(e.message, true); }
+};
+document.getElementById("refreshJobs").onclick = loadJobs;
+
+loadRetention();
+loadJobs();
+setInterval(() => {
+  if (document.getElementById("autoRefresh").checked) {
+    loadRetention();
+    loadJobs();
+  }
+}, 1500);
+</script>
+</body>
+</html>
